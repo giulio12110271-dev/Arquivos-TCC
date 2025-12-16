@@ -1,0 +1,223 @@
+#include <Servo.h>
+
+Servo meuServo;
+const int pinoServo = 9;
+const int pinoEMG = A0;
+
+// Configurações do sistema
+const int NUM_MEDIAS = 10;           // Número de leituras para média móvel
+const int TEMPO_MAX_AMOSTRAGEM = 100; // Tempo máximo para coleta das amostras (ms)
+const float KP_MIN = 0.5;            // Ganho proporcional mínimo
+const float KP_MAX = 2.0;            // Ganho proporcional máximo
+const float KP = 1.2;                // Ganho proporcional atual (ajustável)
+const int EMG_MIN = 0;               // Valor mínimo do EMG (0V = 0)
+const int EMG_MAX = 1023;            // Valor máximo do EMG (5V = 1023)
+const int EMG_MIN_VOLTS = 410;       // 2.0V ≈ 410 (2.0/5.0 * 1023)
+const int EMG_MAX_VOLTS = 614;       // 3.0V ≈ 614 (3.0/5.0 * 1023)
+const int ANG_MIN = 0;               // Ângulo mínimo do servo
+const int ANG_MAX = 180;             // Ângulo máximo do servo
+const int TEMPO_AMOSTRAGEM = 10;     // Tempo de amostragem (8-12 ms)
+
+// Variáveis para média móvel
+int amostrasEMG[NUM_MEDIAS];         // Array para armazenar as amostras
+int indiceAmostra = 0;               // Índice atual do array
+bool bufferCheio = false;            // Indica se o buffer está cheio
+
+// Variáveis para confirmação de leituras
+const int NUM_CONFIRMACOES = 5;      // Número de leituras para confirmação
+int leiturasConfirmacao[NUM_CONFIRMACOES]; // Armazena as últimas decisões
+int indiceConfirmacao = 0;           // Índice atual do array
+bool maoAberta = true;               // Estado atual da mão
+
+// Variáveis de temporização
+unsigned long ultimaAmosrtagem = 0;
+unsigned long ultimaMudanca = 0;
+const unsigned long DEBOUNCE_TIME = 300; // Tempo mínimo entre mudanças
+
+void setup() {
+  Serial.begin(9600);
+  meuServo.attach(pinoServo);
+  
+  // Inicializa arrays
+  for(int i = 0; i < NUM_MEDIAS; i++) {
+    amostrasEMG[i] = 0;
+  }
+  for(int i = 0; i < NUM_CONFIRMACOES; i++) {
+    leiturasConfirmacao[i] = 0;
+  }
+  
+  // Posição inicial - mão aberta
+  meuServo.write(ANG_MIN);
+  Serial.println("✅ SISTEMA PRONTO - CONTROLE PROPORCIONAL COM MÉDIA MÓVEL");
+  Serial.println("Configurações:");
+  Serial.println("- Média móvel: " + String(NUM_MEDIAS) + " amostras");
+  Serial.println("- Kp: " + String(KP));
+  Serial.println("- Faixa EMG: " + String(EMG_MIN_VOLTS) + "-" + String(EMG_MAX_VOLTS));
+  Serial.println("- Amostragem: " + String(TEMPO_AMOSTRAGEM) + "ms");
+}
+
+void loop() {
+  // Coleta e processa o sinal EMG com média móvel
+  int emgProcessado = lerEMGComMediaMovel();
+  
+  // Aplica controle proporcional para posição do servo
+  int anguloDesejado = calcularPosicaoServo(emgProcessado);
+  
+  // Sistema de confirmação para mudanças de estado
+  bool movimentoFechar = (anguloDesejado > 90); // Threshold a 90 graus
+  atualizarConfirmacoes(movimentoFechar);
+  
+  // Verifica se pode mudar o estado (proteção contra bounce)
+  if(millis() - ultimaMudanca > DEBOUNCE_TIME) {
+    processarMudancaEstado(anguloDesejado);
+  }
+  
+  // Monitoramento e debug
+  exibirStatus(emgProcessado, anguloDesejado);
+  
+  delay(10); // Pequeno delay para estabilidade
+}
+
+// Função para ler EMG com média móvel de 10 amostras
+int lerEMGComMediaMovel() {
+  int maiorValor = 0;
+  unsigned long inicio = millis();
+  
+  // Coleta amostras por até 100ms
+  while (millis() - inicio < TEMPO_MAX_AMOSTRAGEM) {
+    unsigned long tempoAmostra = millis();
+    
+    // Coleta uma amostra no tempo especificado
+    int leituraAtual = analogRead(pinoEMG);
+    if (leituraAtual > maiorValor) {
+      maiorValor = leituraAtual;
+    }
+    
+    // Aguarda tempo de amostragem (8-12ms)
+    while(millis() - tempoAmostra < TEMPO_AMOSTRAGEM) {
+      // Espera ativa para precisão temporal
+    }
+  }
+  
+  // Adiciona a maior leitura ao buffer de média móvel
+  amostrasEMG[indiceAmostra] = maiorValor;
+  indiceAmostra = (indiceAmostra + 1) % NUM_MEDIAS;
+  
+  if (indiceAmostra == 0) {
+    bufferCheio = true;
+  }
+  
+  // Calcula média móvel
+  return calcularMediaMovel();
+}
+
+// Calcula a média móvel das amostras
+int calcularMediaMovel() {
+  long soma = 0;
+  int numAmostras = bufferCheio ? NUM_MEDIAS : indiceAmostra;
+  
+  if (numAmostras == 0) return 0;
+  
+  for(int i = 0; i < numAmostras; i++) {
+    soma += amostrasEMG[i];
+  }
+  
+  return soma / numAmostras;
+}
+
+// Aplica controle proporcional para calcular posição do servo
+int calcularPosicaoServo(int valorEMG) {
+  // Mapeia o valor EMG para a faixa desejada com ganho proporcional
+  int emgMapeado = constrain(valorEMG, EMG_MIN_VOLTS, EMG_MAX_VOLTS);
+  
+  // Aplica o ganho proporcional
+  float sinalControle = (emgMapeado - EMG_MIN_VOLTS) * KP;
+  
+  // Calcula o ângulo proporcional ao sinal
+  int angulo = map(sinalControle, 0, (EMG_MAX_VOLTS - EMG_MIN_VOLTS) * KP, ANG_MIN, ANG_MAX);
+  
+  // Garante que está dentro dos limites
+  angulo = constrain(angulo, ANG_MIN, ANG_MAX);
+  
+  return angulo;
+}
+
+// Atualiza o sistema de confirmação
+void atualizarConfirmacoes(bool fechar) {
+  leiturasConfirmacao[indiceConfirmacao] = fechar ? 1 : 0;
+  indiceConfirmacao = (indiceConfirmacao + 1) % NUM_CONFIRMACOES;
+}
+
+// Processa mudança de estado baseado nas confirmações
+void processarMudancaEstado(int anguloDesejado) {
+  int soma = calcularSomaConfirmacoes();
+  
+  // Sistema de decisão por maioria
+  if (soma >= 3) { // Pelo menos 3/5 indica FECHAR
+    if (maoAberta) {
+      executarMovimento(false, anguloDesejado);
+    } else {
+      // Mantém fechado, mas atualiza posição proporcional
+      meuServo.write(anguloDesejado);
+    }
+  } 
+  else { // Maioria indica ABRIR
+    if (!maoAberta) {
+      executarMovimento(true, anguloDesejado);
+    } else {
+      // Mantém aberto, mas atualiza posição proporcional
+      meuServo.write(anguloDesejado);
+    }
+  }
+}
+
+// Calcula soma das confirmações
+int calcularSomaConfirmacoes() {
+  int soma = 0;
+  for(int i = 0; i < NUM_CONFIRMACOES; i++) {
+    soma += leiturasConfirmacao[i];
+  }
+  return soma;
+}
+
+// Executa movimento completo do servo
+void executarMovimento(bool abrir, int angulo) {
+  if(abrir) {
+    meuServo.write(ANG_MIN);
+    maoAberta = true;
+    Serial.println("🖐️ ABERTO");
+  } else {
+    meuServo.write(angulo); // Usa o ângulo calculado proporcionalmente
+    maoAberta = false;
+    Serial.println("✊ FECHADO - Ângulo: " + String(angulo));
+  }
+  ultimaMudanca = millis();
+}
+
+// Exibe status completo do sistema
+void exibirStatus(int emgProcessado, int anguloDesejado) {
+  Serial.print("EMG_Raw:");
+  Serial.print(emgProcessado);
+  Serial.print(" | EMG_Map:");
+  Serial.print(constrain(emgProcessado, EMG_MIN_VOLTS, EMG_MAX_VOLTS));
+  Serial.print(" | Angulo:");
+  Serial.print(anguloDesejado);
+  Serial.print(" | Conf:");
+  for(int i = 0; i < NUM_CONFIRMACOES; i++) {
+    Serial.print(leiturasConfirmacao[i]);
+  }
+  Serial.print(" | Soma:");
+  Serial.print(calcularSomaConfirmacoes());
+  Serial.print(" | Estado:");
+  Serial.print(maoAberta ? "ABERTO" : "FECHADO");
+  Serial.print(" | Kp:");
+  Serial.println(KP);
+}
+
+// Função para ajustar Kp via Serial (opcional)
+void ajustarKp(float novoKp) {
+  if(novoKp >= KP_MIN && novoKp <= KP_MAX) {
+    // KP = novoKp; // Descomente se quiser ajustar via Serial
+    Serial.println("Kp ajustado para: " + String(novoKp));
+  }
+}
